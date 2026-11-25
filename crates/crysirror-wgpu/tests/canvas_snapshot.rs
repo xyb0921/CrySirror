@@ -480,8 +480,20 @@ fn only_registered_immutable_images_can_publish_and_pending_is_not_cached_blank(
     std::fs::write(root.path().join("assets/plain.png"), png([255; 4])).unwrap();
     // A plain project PNG is self-contained and pinned by content, so it may
     // enter a snapshot; unpublished engine names and dynamic surfaces may not.
-    r.set_engine_frame(vec![snapshot_image("plain.png")]).unwrap();
-    assert!(r.capture(&rt.host.scene, &mut rt.assets, [16, 16], [0; 4]).is_ok());
+    let end = Instant::now() + Duration::from_secs(10);
+    loop {
+        r.set_engine_frame(vec![snapshot_image("plain.png")]).unwrap();
+        let shot = r
+            .capture(&rt.host.scene, &mut rt.assets, [16, 16], [0; 4])
+            .unwrap();
+        if shot.get_pixel(1, 1).0 == [255; 4] {
+            assert_eq!(bakes(&mut r), 2);
+            break;
+        }
+        assert_eq!(bakes(&mut r), 1, "pending project image published a blank product");
+        assert!(Instant::now() < end, "project image never finished loading");
+        std::thread::yield_now();
+    }
     for forbidden in ["__crysirror/not-published.png", &dynamic] {
         r.set_engine_frame(vec![snapshot_image(forbidden)]).unwrap();
         assert!(
@@ -505,7 +517,9 @@ fn only_registered_immutable_images_can_publish_and_pending_is_not_cached_blank(
 #[test]
 #[ignore = "requires a real wgpu adapter and a system font; execute explicitly"]
 fn frozen_canvas_text_rasterizes_from_the_shared_font() {
-    let Ok(font) = std::fs::read("/System/Library/Fonts/Supplemental/Arial.ttf") else {
+    let path = std::env::var_os("CRYSIRROR_TEST_FONT")
+        .unwrap_or_else(|| "/System/Library/Fonts/Supplemental/Arial.ttf".into());
+    let Ok(font) = std::fs::read(path) else {
         eprintln!("no system font; skipped");
         return;
     };
@@ -541,6 +555,30 @@ fn bgra_presenter_materializes_rgba_snapshot_without_swapping_red_and_blue() {
     let layers=Arc::new(layers);
     let image=renderer.materialize_snapshot(&mut rt.assets,1,[2,2],&layers).unwrap().unwrap();
     assert!(image.pixels().all(|pixel|pixel.0==[255,0,0,255]));
+}
+
+#[test]
+#[ignore = "requires a real wgpu adapter; execute explicitly"]
+fn same_size_snapshots_keep_independent_pixels_when_reusing_scratch() {
+    let (_root, mut rt, mut renderer) = fixture();
+    let mut commands = Vec::new();
+    for (id, x, color) in [(1, 0, [255, 0, 0, 255]), (2, 8, [0, 0, 255, 255])] {
+        commands.push(json!({"op":"put","layer":{
+            "id":id,"rect":[x,0,8,8],"paint":{"kind":"snapshot","size":[8,8],
+            "layers":[{"id":1,"rect":[0,0,8,8],"paint":{"kind":"solid","color":color}}]}
+        }}));
+    }
+    submit(&mut rt, json!({"layers":commands.clone()}));
+    let frame = capture(&mut rt, &mut renderer);
+    assert_eq!(frame.get_pixel(4, 4).0, [255, 0, 0, 255]);
+    assert_eq!(frame.get_pixel(12, 4).0, [0, 0, 255, 255]);
+    assert_eq!(bakes(&mut renderer), 2);
+
+    submit(&mut rt, json!({"layers":[{"op":"remove","id":1},{"op":"remove","id":2}]}));
+    assert!(capture(&mut rt, &mut renderer).pixels().all(|p| p.0 == [0; 4]));
+    submit(&mut rt, json!({"layers":commands}));
+    assert_eq!(capture(&mut rt, &mut renderer), frame);
+    assert_eq!(bakes(&mut renderer), 2, "retained cells should not rasterize again");
 }
 
 #[test]
