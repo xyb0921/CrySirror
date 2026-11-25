@@ -1430,6 +1430,66 @@ mod budget_tests {
     }
 
     #[test]
+    fn projected_bitmap_copy_matches_unpruned_pixels_with_signed_clipping() {
+        let memory = Arc::new(AtomicUsize::new(0));
+        let stream = Arc::new(Stream {
+            bytes: Arc::from([]),
+            reads: Arc::new(AtomicUsize::new(0)),
+            declared: None,
+        });
+        let base = ImageInput::Solid { size: [4, 3], color: [35, 45, 55, 100] };
+        let partial = ImageCompositeLayer {
+            input: Box::new(ImageInput::Solid { size: [4, 3], color: [90, 115, 155, 200] }),
+            source: [0, 0, 4, 3],
+            destination: [-1, 0],
+            clip: Some([0, 0, 2, 2]),
+            opacity: 255,
+            math: ImageCompositeMath::Copy,
+        };
+        let blend = ImageCompositeLayer {
+            input: Box::new(ImageInput::Solid { size: [2, 3], color: [70, 190, 110, 160] }),
+            source: [0, 0, 2, 3],
+            destination: [1, 0],
+            clip: Some([2, 1, 2, 2]),
+            opacity: 230,
+            math: ImageCompositeMath::Ps { blend: PsBlend::SoftLight, hold_alpha: true },
+        };
+        let copy = ImageCompositeLayer {
+            input: Box::new(ImageInput::Composite {
+                base: Box::new(base.clone()),
+                layers: vec![partial, blend],
+            }),
+            source: [1, 0, 2, 3],
+            destination: [0, 0],
+            clip: Some([0, 1, 2, 2]),
+            opacity: 255,
+            math: ImageCompositeMath::Copy,
+        };
+        let unpruned = ImageInput::Composite {
+            base: Box::new(base.clone()),
+            layers: vec![copy.clone()],
+        };
+        let projected = base.with_composite_layer(copy);
+        let render = |input| {
+            let mut job = begin(
+                ClientId(7),
+                input,
+                Arc::from(&b"[]"[..]),
+                Arc::new(Storage(stream.clone())),
+                DecoderRegistry::default(),
+                TaskPool::new("projected-copy-test", 1, 8).unwrap(),
+                memory.clone(),
+                None,
+            )
+            .unwrap();
+            let state = wait(&mut job);
+            let ImageProcessState::Ready(image) = state else { panic!("{state:?}"); };
+            image.rgba()
+        };
+        assert_eq!(render(projected), render(unpruned));
+    }
+
+    #[test]
     fn adjacent_tiles_reuse_verified_source_pixels() {
         let memory = Arc::new(AtomicUsize::new(0));
         let pixels = [8, 16, 32, 255];

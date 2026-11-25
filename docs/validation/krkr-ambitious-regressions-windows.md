@@ -142,3 +142,26 @@ dominates these waits. Slot 0009 did not use the same Soft Light loop in
 this interval. The two updated Release replays completed 9,550 ticks with
 presentation clear after Ctrl release. Both used separate saves, Vulkan
 offscreen rendering and audio output disabled.
+
+## Retained copy history during slot 0008 fast-forward
+
+2026-11-26. A Windows Release diagnostic timed the CPU bitmap workers in the
+same copy of slot 0008. Across the first 6.4 simulated seconds of the Ctrl
+hold, a 1041 × 1152 composition grew from 45 to 261 input nodes in the
+trace. The longest sampled worker task took 516 ms of wall time, including
+372 ms in image decoding and 109 ms in bitmap blending. Worker queue
+time for that task was 55 microseconds.
+
+The shared compositor now limits a copied source recipe to the pixels
+sampled by that copy. It releases previous destination writes fully covered
+by a new full-opacity RGBA copy. Partially covered writes and blending order
+remain in the graph. Source coordinates and output dimensions are preserved.
+
+In paired 7,900-tick Release replays, the longest Soft Light retry gap
+in the same 6.4-second input interval dropped from 416 to 128 simulated ms.
+The scene completed 43 color adjustments in that interval, up from 19.
+In a 9,550-tick repeat, the updated slot 0008 replay reached 45 adjustments
+with a 112 ms maximum in the same interval. Both slots completed all 9,550
+ticks and had released the presentation hold after Ctrl was released.
+These timings use the offscreen clock. The Windows presenter needs its own
+wall-clock check.
