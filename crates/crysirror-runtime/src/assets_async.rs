@@ -562,6 +562,29 @@ pub(crate) struct ImagePreparation {
     profiler: crysirror_tasks::profile::Profiler,
 }
 impl ImagePreparation {
+    /// Borrow only a completed image from this client's current asset scope.
+    /// A worker may run while the owner is waiting on the cache's task pool.
+    pub(crate) fn verified_image(
+        &self,
+        client: ClientId,
+        path: &str,
+        size: [u32; 2],
+        fingerprint: &[u8; 32],
+    ) -> Option<Arc<crysirror_image::ImageSurface>> {
+        let cache = self.cache.upgrade()?;
+        let mut cache = cache.try_lock().ok()?;
+        let id = *cache.keys.get(&(client, AssetKind::Image, path.to_owned()))?;
+        let entry = cache.entries.get_mut(&id)?;
+        let Some(Prepared::Image(image, Some((decoded_size, _, hash)))) = &entry.value else {
+            return None;
+        };
+        if *decoded_size != size || hash != fingerprint {
+            return None;
+        }
+        entry.touched = web_time::Instant::now();
+        Some(image.clone())
+    }
+
     pub(crate) fn scoped_storage(&self, client: ClientId) -> Option<(u64, Arc<dyn ClientStorage>)> {
         let cache = self.cache.upgrade()?;
         let cache = cache.lock().expect("prepared asset cache poisoned");

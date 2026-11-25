@@ -4358,6 +4358,7 @@ impl crysirror_core::service::ImageMetadata for SharedImageMetadata {
             self.decoders.clone(),
             self.tasks.clone(),
             self.memory.clone(),
+            Some(self.prepared.clone()),
         )
     }
 

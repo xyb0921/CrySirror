@@ -78,3 +78,67 @@ At tick 19200 the old jacket measured 11 and the new jacket still measured 59.
 The direct load of slot 0007 and both scripted Ctrl holds and releases
 completed. These replays used copied saves and the Vulkan offscreen renderer
 with audio output disabled.
+
+## CPU frame spikes during Ctrl fast-forward from slot 0007
+
+2026-11-25. A Windows x86-64 Release comparison loaded the same slot and
+held Ctrl for 1,800 virtual frames. The capture used Vulkan offscreen
+rendering with audio output disabled. The CPU profiler measured the engine
+frame, including the offscreen asset-completion quantum.
+
+The TJS member table now allocates buckets on the first insertion. Empty
+objects and reclaimed slots retain the logical bucket count and native hash
+rebuild rules. The regression test covers lookup, removal and rebuild before
+the first insert. The existing enumeration tests exercise collision order.
+
+In the measured pair, the longest engine frame changed from 71.12 ms to
+58.71 ms. The collector peak changed from 32.08 ms to 26.29 ms. P95 was
+19.00 ms and 19.03 ms respectively. The capture after releasing Ctrl matched
+exactly. Script callbacks and layer commits still accounted for the longest
+frames in the updated replay.
+
+## Sliced portrait redraws during Ctrl fast-forward from slot 0008
+
+2026-11-25. Slot 0008 restores the two-person park scene, and slot 0009
+restores a classroom scene. In the supplied park recording the picture stays
+nearly unchanged for up to 3.37 seconds. These recordings cover different
+scenes, so each slot is replayed independently for before/after verification.
+
+The park script copies the same expression rectangle across body strips. In
+one trace, six of eight source rectangles were entirely outside their strips.
+The retained bitmap graph still expanded those strips before the subsequent
+tiled Photoshop blend. The scripted Ctrl replay recorded a 752 ms virtual-time
+gap between the first attempt and retry of one tile operation. That gap spans
+multiple engine ticks. The script had stopped its voice buffers at skip entry.
+
+The adapter now checks the source and destination bounds before retaining a
+bitmap copy. Fully disjoint rectangles add no Canvas operation or CPU history.
+Partial intersections retain their signed coordinates. The Release regression
+test covers six empty strip copies followed by a partially intersecting strip.
+
+In the first 6.4 seconds of the matching slot 0008 Ctrl input track, the
+number of portrait color-adjustment calls increased from 9 to 18. The longest
+retry gap for the tiled blend dropped from 752 to 384 ms of virtual time. The
+slot 0009 trace had no calls to that blend during the same interval. Both
+updated Windows Release replays received Ctrl-down and Ctrl-up, completed
+9,050 ticks and exited successfully. All 24 KiriKiri library tests passed.
+The replays used Vulkan offscreen rendering and copied saves with audio
+output disabled. Interactive wall-clock pacing requires a windowed check.
+
+## Reuse decoded inputs in tiled portrait redraws
+
+2026-11-26. The park trace records Photoshop Soft Light operations after
+expression copies, followed by a separate HSL adjustment. The image worker
+reuses an immutable source across consecutive tiles. Compositions can reuse
+prepared TLG pixels after verifying the current bytes with the job's storage
+reader. The adapter skips blend tiles disjoint from the source or draw clip.
+Partial intersections retain their original coordinates.
+
+In the first 6.4 simulated seconds of the same slot 0008 Ctrl input, the
+Soft Light retry count changed from 101 to 67 and the scene reached 19
+color adjustments compared with 18. The longest retry gap changed from
+384 to 400 simulated ms. Preparation of the slower portrait redraws still
+dominates these waits. Slot 0009 did not use the same Soft Light loop in
+this interval. The two updated Release replays completed 9,550 ticks with
+presentation clear after Ctrl release. Both used separate saves, Vulkan
+offscreen rendering and audio output disabled.

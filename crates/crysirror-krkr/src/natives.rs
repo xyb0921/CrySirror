@@ -3354,6 +3354,15 @@ fn layer_copy(
         rt.host_mut().api_calls+=1;
         return Ok(Variant::Void);
     }
+    // Sliced portraits can copy the same face rectangle from every strip.
+    // A disjoint strip contributes no pixels. Keeping that copy in the
+    // retained bitmap source would decode the strip's entire history when a
+    // later CPU blend materializes the portrait.
+    if !rt.host().motion.has_frame(src.0)
+        && bitmap_rect_is_disjoint(source, dest, [sx, sy, sw, sh], [dx, dy])
+    {
+        return Ok(Variant::Void);
+    }
     // A complete destination replacement can select one cell from a larger
     // source atlas. The shared Canvas copy clips/snapshots that cell itself.
     let whole = [dx, dy] == [0, 0]
@@ -3400,6 +3409,24 @@ fn layer_copy(
     }
     host.api_calls += 1;
     Ok(Variant::Void)
+}
+
+fn bitmap_rect_is_disjoint(
+    source: &LayerState,
+    destination: &LayerState,
+    rect: [i64; 4],
+    at: [i64; 2],
+) -> bool {
+    matches!(
+        crysirror_core::region_map::clip_region_copy(
+            Some([source.image_width as u32, source.image_height as u32]),
+            [destination.image_width as u32, destination.image_height as u32],
+            rect,
+            at,
+            destination.draw_clip,
+        ),
+        Ok(None)
+    )
 }
 
 /// krkrz omPs* modes with an exact byte-table form in the shared compositor.
@@ -3450,8 +3477,19 @@ fn layer_operate_ps_cpu(
     if opacity == 0 || rect[2] <= 0 || rect[3] <= 0 {
         return Ok(Variant::Void);
     }
-    let source = rt.host().layer(src)?.clone();
-    let dest = rt.host().layer(h)?.clone();
+    let source = rt.host().layer(src)?;
+    let dest = rt.host().layer(h)?;
+    // Expression redraws can run the whole tile loop with a small draw clip.
+    // Empty tiles must not consume an operation slot or materialize a bitmap.
+    if source.has_image
+        && dest.has_image
+        && !rt.host().motion.has_frame(src.0)
+        && bitmap_rect_is_disjoint(source, dest, rect, [dx, dy])
+    {
+        return Ok(Variant::Void);
+    }
+    let source = source.clone();
+    let dest = dest.clone();
     let math = crysirror_core::image_processing::ImageCompositeMath::Ps { blend, hold_alpha };
     if rt.host().bitmap_batch.as_ref().is_some_and(|b| b.target != h.0 || b.operations >= 64) {
         crate::image_api::before_bitmap_call(rt)?;

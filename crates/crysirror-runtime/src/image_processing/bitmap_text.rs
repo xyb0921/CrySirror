@@ -52,8 +52,15 @@ pub(crate) fn begin(
         .spawn(move |cancel| {
             let _scratch = scratch;
             cancel.check()?;
-            let mut surface =
-                load_inner(owner, &input, &storage, &decoders, &cancel, Some(&memory))?;
+            let context = ImageLoad {
+                owner,
+                storage: &storage,
+                decoders: &decoders,
+                cancel: &cancel,
+                encoded_memory: Some(&memory),
+                prepared: None,
+            };
+            let mut surface = load_inner(&input, &context)?;
             text.rasterize_bitmap_records(&mut surface, &spec, &|| cancel.check())?;
             resource_from_surface(owner, surface, output, &|| cancel.check())
         })
