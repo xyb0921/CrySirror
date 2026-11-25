@@ -70,6 +70,11 @@ The archive reader verifies the key's first line against the entire Nana
 control table, all six name-state words and both content filter parameters
 before publishing the callback's bootstrap profile. The original script
 still reads that file through `Array.load` and passes its first line.
+[`profiles/nana`](../profiles/nana) holds the bundle format, a self-consistent
+placeholder profile and the installer; a profile recovered from a real
+installation stays with that installation.
+`python tools/install_nana_profile.py --game-dir <install>` re-derives every stored
+value from the startup key before it places the companions.
 
 Rust, JS/TS and inspection tools use the same `Resources` class:
 

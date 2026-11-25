@@ -1,0 +1,39 @@
+{
+  "name": "example",
+  "game": "Placeholder profile (example data, not a game)",
+  "executable": "example.exe",
+  "protected_archive": "data.xp3",
+  "runtime": "KiriKiri Z",
+  "detection": "Place the companions beside the XP3 archives. crysirror-launch takes the profile as its first Nana candidate and looks for the startup key under the selected executable's stem.",
+  "derivation": {
+    "startup_line_source": "example.key: a UTF-16LE record whose first line the native bootstrap passes to Array.load",
+    "control_block": "SHAKE256 over the UTF-16LE startup line, truncated to CONTROL_BLOCK_SIZE (4096)",
+    "filter_parameters": "SipHash-2-4 keyed by control[0:16] over the UTF-16LE startup line",
+    "code": "crates/crysirror-formats-arc/src/xp3/cxdec/nana_profile.rs"
+  },
+  "files": [
+    {
+      "name": "crysirror-nana.local.json",
+      "role": "profile",
+      "size": 275,
+      "sha256": "36c67ddcf46d8c5405f57aace4c16ad35be5351131dae8aa15358a62ae8b677b"
+    },
+    {
+      "name": "content-table.bin",
+      "role": "control_block",
+      "size": 4096,
+      "sha256": "7d8d05c8c4a45558f4e2bc01d91778de7b396065f5865d8088b4e491424251f1"
+    },
+    {
+      "name": "example.key",
+      "role": "startup_key",
+      "size": 44,
+      "sha256": "2504fdedb613506f8f8026c7288782843f99303bef8048e418954d4dbb9ca773"
+    }
+  ],
+  "notes": [
+    "Example data only: the startup line is a fixed placeholder string and the content parameters are not a real title's.",
+    "The bundle still verifies: --check re-derives the control table, mask, offset and name state from example.key.",
+    "Installing this into a real game directory does not unlock that game; generate a bundle from your own installation instead."
+  ]
+}
