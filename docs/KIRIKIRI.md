@@ -38,7 +38,10 @@ modules. The complete inflated directory must match the archive's name
 tokens and Adler-32 values. The existing CXDEC module reader supplies the
 Cabbage content parameters and control table. Every protected resource is
 checksum-verified before it is returned. This layout can be read directly
-from the original files. Retail Loca-Love startup remains unverified.
+from the original files. The tested retail build of Loca-Love: My Shrine
+Crush required matching local companions to reach gameplay on Windows.
+See [SATD-formats-arc-krkr-madocrypt-nana-installed](../crates/crysirror-formats-arc/SATD.md#satd-formats-arc-krkr-madocrypt-nana-installed)
+for the clean-install boundary.
 
 For other layouts with independently recovered parameters, the
 [xp3-brute PR #3 profile format](https://github.com/xmoezzz/xp3-brute/pull/3)

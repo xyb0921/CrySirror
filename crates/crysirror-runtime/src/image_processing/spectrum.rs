@@ -101,15 +101,15 @@ pub(crate) fn begin(
             let state = crysirror_audio::spectrum_graph::analyze(&samples, &spec, state, &|| {
                 cancel.check()
             })?;
-            let mut image = process_input(
+            let context = ImageLoad {
                 owner,
-                &input,
-                &[],
-                &storage,
-                &decoders,
-                &cancel,
-                Some(&memory),
-            )?;
+                storage: &storage,
+                decoders: &decoders,
+                cancel: &cancel,
+                encoded_memory: Some(&memory),
+                prepared: None,
+            };
+            let mut image = process_input(&input, &[], &context)?;
             crysirror_image::spectrum_graph::draw(&mut image, &spec, &state, &|| cancel.check())?;
             let image = resource_from_surface(owner, image, output, &|| cancel.check())?;
             Ok(SpectrumGraphReceipt {

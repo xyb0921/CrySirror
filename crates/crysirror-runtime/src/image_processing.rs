@@ -2,6 +2,7 @@
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. A copy is available at https://mozilla.org/MPL/2.0/.
 //! One shared CPU image pipeline for native adapters and public bitmap jobs.
+use crate::assets::{ImagePreparation, is_tlg};
 use crysirror_core::{Error, Result, image_processing::*, service::ClientStorage, state::ClientId};
 use crysirror_image::{DecoderRegistry, ImageSurface, effects::ImageEffect};
 use crysirror_tasks::{Task, TaskPool};
@@ -146,6 +147,7 @@ pub(crate) fn begin(
     decoders: DecoderRegistry,
     pool: TaskPool,
     memory: Arc<AtomicUsize>,
+    prepared: Option<ImagePreparation>,
 ) -> Result<ImageJob> {
     if effects.len() > MAX_EFFECT_SPEC_BYTES {
         return Err(Error::Limit("image effect specification"));
@@ -204,15 +206,15 @@ pub(crate) fn begin(
         .spawn(move |cancel| {
             let _scratch = scratch;
             cancel.check()?;
-            let image = process_input(
+            let context = ImageLoad {
                 owner,
-                &input,
-                &effects,
-                &storage,
-                &decoders,
-                &cancel,
-                Some(&memory),
-            )?;
+                storage: &storage,
+                decoders: &decoders,
+                cancel: &cancel,
+                encoded_memory: Some(&memory),
+                prepared: prepared.as_ref(),
+            };
+            let image = process_input(&input, &effects, &context)?;
             resource_from_surface(owner, image, output, &|| cancel.check())
         })
         .map_err(|e| Error::Io(e.to_string()))?;
@@ -507,16 +509,12 @@ fn validate_effect_context(input: &ImageInput, effects: &[ImageEffect]) -> Resul
     Ok(())
 }
 fn process_input(
-    owner: ClientId,
     input: &ImageInput,
     effects: &[ImageEffect],
-    storage: &Arc<dyn ClientStorage>,
-    decoders: &DecoderRegistry,
-    cancel: &crysirror_tasks::Cancellation,
-    encoded_memory: Option<&Arc<AtomicUsize>>,
+    context: &ImageLoad<'_>,
 ) -> anyhow::Result<ImageSurface> {
-    let load_input =
-        |input: &ImageInput| load_inner(owner, input, storage, decoders, cancel, encoded_memory);
+    let cancel = context.cancel;
+    let load_input = |input: &ImageInput| load_inner(input, context);
     let (mut image, other, mask) = match input {
         ImageInput::Transition { from, to, mask } => (
             load_input(&ImageInput::Resource(from.clone()))?,
@@ -1009,6 +1007,15 @@ fn input_size_inner(
     }
     Ok(size)
 }
+struct ImageLoad<'a> {
+    owner: ClientId,
+    storage: &'a Arc<dyn ClientStorage>,
+    decoders: &'a DecoderRegistry,
+    cancel: &'a crysirror_tasks::Cancellation,
+    encoded_memory: Option<&'a Arc<AtomicUsize>>,
+    prepared: Option<&'a ImagePreparation>,
+}
+
 pub(crate) fn load(
     owner: ClientId,
     input: &ImageInput,
@@ -1016,17 +1023,12 @@ pub(crate) fn load(
     decoders: &DecoderRegistry,
     cancel: &crysirror_tasks::Cancellation,
 ) -> anyhow::Result<ImageSurface> {
-    load_inner(owner, input, storage, decoders, cancel, None)
+    let context = ImageLoad { owner, storage, decoders, cancel, encoded_memory: None, prepared: None };
+    load_inner(input, &context)
 }
 
-fn load_inner(
-    owner: ClientId,
-    input: &ImageInput,
-    storage: &Arc<dyn ClientStorage>,
-    decoders: &DecoderRegistry,
-    cancel: &crysirror_tasks::Cancellation,
-    encoded_memory: Option<&Arc<AtomicUsize>>,
-) -> anyhow::Result<ImageSurface> {
+fn load_inner(input: &ImageInput, context: &ImageLoad<'_>) -> anyhow::Result<ImageSurface> {
+    let ImageLoad { owner, storage, decoders, cancel, .. } = *context;
     cancel.check()?;
     match input {
         ImageInput::ParticlePlane { size, sprites } => {
@@ -1046,21 +1048,13 @@ fn load_inner(
         }
         ImageInput::FieldWarp { source, size, spec } => {
             spec.validate(owner, *size)?;
-            let source = load_inner(owner, source, storage, decoders, cancel, encoded_memory)?;
+            let source = load_inner(source, context)?;
             crysirror_image::vector_field::warp(&source, *size, spec, &|| cancel.check())
         }
         ImageInput::Process { input, effects } => {
             let effects = parse_effect_chain(effects)?;
             validate_effect_context(input, &effects)?;
-            process_input(
-                owner,
-                input,
-                &effects,
-                storage,
-                decoders,
-                cancel,
-                encoded_memory,
-            )
+            process_input(input, &effects, context)
         }
         ImageInput::Encoded { name, bytes, size } => {
             cancel.check()?;
@@ -1081,7 +1075,9 @@ fn load_inner(
         }
         ImageInput::Composite { base, layers } => {
             use crysirror_image::bitmap::{BitmapRect, BlitOptions, PixelMath};
-            let mut image = load_inner(owner, base, storage, decoders, cancel, encoded_memory)?;
+            let mut image = load_inner(base, context)?;
+            let mut source = None;
+            let mut previous = None;
             for layer in layers {
                 cancel.check()?;
                 let (mut rect, mut destination) = (layer.source, layer.destination);
@@ -1099,14 +1095,15 @@ fn load_inner(
                     rect[3] = bottom - top;
                     destination = [left, top];
                 }
-                let source = load_inner(
-                    owner,
-                    &layer.input,
-                    storage,
-                    decoders,
-                    cancel,
-                    encoded_memory,
-                )?;
+                // Tiled blends and sliced portraits can read the same immutable
+                // pixels for adjacent writes. Drop a different source before
+                // loading its replacement so the existing scratch bound applies.
+                if !previous.is_some_and(|input| same_bitmap_source(input, &layer.input)) {
+                    drop(source.take());
+                    source = Some(load_inner(&layer.input, context)?);
+                }
+                previous = Some(layer.input.as_ref());
+                let source = source.as_ref().expect("composite source loaded");
                 if let ImageCompositeMath::IntegerStored {
                     destination_format,
                     source_format,
@@ -1117,7 +1114,7 @@ fn load_inner(
                     crysirror_image::integer_raster::region::blit_stored_region(
                         &mut image,
                         destination_format,
-                        &source,
+                        source,
                         source_format,
                         rect,
                         destination,
@@ -1132,7 +1129,7 @@ fn load_inner(
                 }
                 if let ImageCompositeMath::Normalized(state) = layer.math {
                     image.blend_fixed_factors(
-                        &source,
+                        source,
                         BitmapRect::new(rect[0], rect[1], rect[2] as u32, rect[3] as u32),
                         destination,
                         state,
@@ -1192,7 +1189,7 @@ fn load_inner(
                         cancel.check()?;
                     }
                     image.blit(
-                        &source,
+                        source,
                         BlitOptions {
                             source_rect: BitmapRect::new(rect[0], rect[1] + row, rect[2] as u32, 1),
                             destination: [destination[0], destination[1] + row],
@@ -1226,12 +1223,27 @@ fn load_inner(
         } => {
             use crysirror_core::path::{Mount, VfsPath};
             let path = VfsPath::new(Mount::Asset, path).map_err(|e| anyhow::anyhow!("{e}"))?;
-            load_scoped_asset(&path, *size, fingerprint.as_ref(), storage, decoders, cancel, encoded_memory)
+            load_scoped_asset(&path, *size, fingerprint.as_ref(), context)
         }
         ImageInput::ScopedAsset {path,size,fingerprint} => {
-            load_scoped_asset(path, *size, fingerprint.as_ref(), storage, decoders, cancel, encoded_memory)
+            load_scoped_asset(path, *size, fingerprint.as_ref(), context)
         }
         _ => anyhow::bail!("nested image input is not supported"),
+    }
+}
+
+fn same_bitmap_source(first: &ImageInput, second: &ImageInput) -> bool {
+    match (first, second) {
+        (ImageInput::Resource(first), ImageInput::Resource(second)) => Arc::ptr_eq(first, second),
+        (
+            ImageInput::Solid { size: first_size, color: first_color },
+            ImageInput::Solid { size: second_size, color: second_color },
+        ) => first_size == second_size && first_color == second_color,
+        (
+            ImageInput::Asset { path: first_path, size: first_size, fingerprint: Some(first_hash) },
+            ImageInput::Asset { path: second_path, size: second_size, fingerprint: Some(second_hash) },
+        ) => first_path == second_path && first_size == second_size && first_hash == second_hash,
+        _ => false,
     }
 }
 
@@ -1239,14 +1251,13 @@ fn load_scoped_asset(
     path: &crysirror_core::path::VfsPath,
     size: [u32; 2],
     fingerprint: Option<&[u8; 32]>,
-    storage: &Arc<dyn ClientStorage>,
-    decoders: &DecoderRegistry,
-    cancel: &crysirror_tasks::Cancellation,
-    encoded_memory: Option<&Arc<AtomicUsize>>,
+    context: &ImageLoad<'_>,
 ) -> anyhow::Result<ImageSurface> {
+    use crysirror_core::path::Mount;
+    let ImageLoad { owner, storage, decoders, cancel, encoded_memory, prepared } = *context;
     cancel.check()?;
     let reader =
-        if encoded_memory.is_some() || path.mount() != crysirror_core::path::Mount::Asset {
+        if encoded_memory.is_some() || path.mount() != Mount::Asset {
             storage.open_read(path)
         } else {
             storage.open_asset(path)
@@ -1273,6 +1284,17 @@ fn load_scoped_asset(
             blake3::hash(&bytes).as_bytes() == hash,
             "image asset changed since native load"
         );
+        // Keep the stream and fingerprint validation even on a cache hit.
+        // The prepared cache may predate an edit to a loose mounted asset.
+        if path.mount() == Mount::Asset
+            && is_tlg(path.relative())
+            && let Some(image) = prepared.and_then(|cache| {
+                cache.verified_image(owner, path.relative(), size, hash)
+            })
+        {
+            cancel.check()?;
+            return Ok((*image).clone());
+        }
     }
     let image = decoders.decode(path.relative(), &bytes)?;
     anyhow::ensure!(
@@ -1378,6 +1400,7 @@ mod budget_tests {
             DecoderRegistry::default(),
             TaskPool::new("image-budget-test", 1, 8).unwrap(),
             memory,
+            None,
         )
         .unwrap()
     }
@@ -1404,6 +1427,118 @@ mod budget_tests {
         assert_eq!(input_size(ClientId(7), &composition, 0, &mut nodes, &mut bytes).unwrap(), extent);
         assert_eq!(nodes, 10);
         assert_eq!(bytes, crysirror_image::rgba_len(extent[0], extent[1]).unwrap() * 3);
+    }
+
+    #[test]
+    fn projected_bitmap_copy_matches_unpruned_pixels_with_signed_clipping() {
+        let memory = Arc::new(AtomicUsize::new(0));
+        let stream = Arc::new(Stream {
+            bytes: Arc::from([]),
+            reads: Arc::new(AtomicUsize::new(0)),
+            declared: None,
+        });
+        let base = ImageInput::Solid { size: [4, 3], color: [35, 45, 55, 100] };
+        let partial = ImageCompositeLayer {
+            input: Box::new(ImageInput::Solid { size: [4, 3], color: [90, 115, 155, 200] }),
+            source: [0, 0, 4, 3],
+            destination: [-1, 0],
+            clip: Some([0, 0, 2, 2]),
+            opacity: 255,
+            math: ImageCompositeMath::Copy,
+        };
+        let blend = ImageCompositeLayer {
+            input: Box::new(ImageInput::Solid { size: [2, 3], color: [70, 190, 110, 160] }),
+            source: [0, 0, 2, 3],
+            destination: [1, 0],
+            clip: Some([2, 1, 2, 2]),
+            opacity: 230,
+            math: ImageCompositeMath::Ps { blend: PsBlend::SoftLight, hold_alpha: true },
+        };
+        let copy = ImageCompositeLayer {
+            input: Box::new(ImageInput::Composite {
+                base: Box::new(base.clone()),
+                layers: vec![partial, blend],
+            }),
+            source: [1, 0, 2, 3],
+            destination: [0, 0],
+            clip: Some([0, 1, 2, 2]),
+            opacity: 255,
+            math: ImageCompositeMath::Copy,
+        };
+        let unpruned = ImageInput::Composite {
+            base: Box::new(base.clone()),
+            layers: vec![copy.clone()],
+        };
+        let projected = base.with_composite_layer(copy);
+        let render = |input| {
+            let mut job = begin(
+                ClientId(7),
+                input,
+                Arc::from(&b"[]"[..]),
+                Arc::new(Storage(stream.clone())),
+                DecoderRegistry::default(),
+                TaskPool::new("projected-copy-test", 1, 8).unwrap(),
+                memory.clone(),
+                None,
+            )
+            .unwrap();
+            let state = wait(&mut job);
+            let ImageProcessState::Ready(image) = state else { panic!("{state:?}"); };
+            image.rgba()
+        };
+        assert_eq!(render(projected), render(unpruned));
+    }
+
+    #[test]
+    fn adjacent_tiles_reuse_verified_source_pixels() {
+        let memory = Arc::new(AtomicUsize::new(0));
+        let pixels = [8, 16, 32, 255];
+        let png = crysirror_image::encode_png(&ImageSurface::filled(1, 1, pixels).unwrap())
+            .unwrap();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let tile = ImageCompositeLayer {
+            input: Box::new(ImageInput::Asset {
+                path: "tiny.png".into(),
+                size: [1, 1],
+                fingerprint: Some(*blake3::hash(&png).as_bytes()),
+            }),
+            source: [0, 0, 1, 1],
+            destination: [0, 0],
+            clip: None,
+            opacity: 255,
+            math: ImageCompositeMath::Copy,
+        };
+        let mut next_tile = tile.clone();
+        next_tile.destination = [1, 0];
+        let input = ImageInput::Composite {
+            base: Box::new(ImageInput::Solid { size: [2, 1], color: [0; 4] }),
+            layers: vec![tile, next_tile],
+        };
+        let stream = Arc::new(Stream {
+            bytes: png.into(),
+            reads: reads.clone(),
+            declared: None,
+        });
+        let mut job = begin(
+            ClientId(7),
+            input,
+            Arc::from(&b"[]"[..]),
+            Arc::new(Storage(stream)),
+            DecoderRegistry::default(),
+            TaskPool::new("composite-source-test", 1, 8).unwrap(),
+            memory.clone(),
+            None,
+        )
+        .unwrap();
+        let result = wait(&mut job);
+        let ImageProcessState::Ready(image) = &result else {
+            panic!("{result:?}");
+        };
+        assert_eq!(&*image.rgba(), &pixels.repeat(2));
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        drop(result);
+        drop(job);
+        assert_eq!(memory.load(Ordering::Acquire), 0);
     }
 
     #[test]
@@ -1443,6 +1578,7 @@ mod budget_tests {
             DecoderRegistry::default(),
             TaskPool::new("alpha-stamp-test", 1, 8).unwrap(),
             memory.clone(),
+            None,
         )
         .unwrap();
         let result = wait(&mut job);

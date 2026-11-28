@@ -1,15 +1,29 @@
 //! Retain bitmap operation order without keeping pixels a complete copy replaces.
 use super::{ImageCompositeLayer, ImageCompositeMath, ImageInput};
+use crate::region_map::clip_region_copy;
 use alloc::{boxed::Box, vec};
 
 impl ImageInput {
-    /// Append an immutable bitmap operation, discarding the destination history
-    /// only when a full-opacity four-channel copy provably replaces every pixel.
-    /// RGB/alpha-only copies, partial clips and out-of-source rectangles retain it.
-    pub fn with_composite_layer(self, layer: ImageCompositeLayer) -> Self {
+    /// Append an immutable bitmap operation. A copy reads only its clipped
+    /// source region. Full-opacity RGBA copies also discard earlier writes
+    /// wholly covered by the replacement.
+    pub fn with_composite_layer(self, mut layer: ImageCompositeLayer) -> Self {
         let (Some(size), Some(source_size)) = (extent(&self), extent(&layer.input)) else {
             return append(self, layer);
         };
+        // This copy owns its source recipe. Writes outside the sampled source
+        // rectangle cannot affect it, even when the original layer still
+        // needs those pixels in future reads.
+        let copied = if matches!(layer.math, ImageCompositeMath::Copy) {
+            clipped_layer(&layer, size).ok().flatten()
+        } else {
+            None
+        };
+        if let Some((sample, _)) = copied
+            && matches!(*layer.input, Self::Composite { .. })
+        {
+            layer.input = Box::new(retain_sampled_writes(*layer.input, sample));
+        }
         let [sx, sy, width, height] = layer.source;
         let [dx, dy] = layer.destination;
         let full_copy = matches!(layer.math, ImageCompositeMath::Copy)
@@ -47,7 +61,111 @@ impl ImageInput {
                 layers: vec![layer],
             };
         }
-        append(self, layer)
+        let base = match copied {
+            Some(([_, _, w, h], [x, y])) if layer.opacity == 255 => {
+                discard_overwritten_writes(self, size, [x, y, w, h])
+            }
+            _ => self,
+        };
+        append(base, layer)
+    }
+}
+
+type Rect = [i64; 4];
+
+fn clipped_layer(
+    layer: &ImageCompositeLayer,
+    size: [u32; 2],
+) -> crate::Result<Option<(Rect, [i64; 2])>> {
+    clip_region_copy(
+        extent(&layer.input),
+        size,
+        layer.source.map(i64::from),
+        layer.destination.map(i64::from),
+        layer.clip.map(|clip| clip.map(i64::from)),
+    )
+}
+
+fn intersect(a: Rect, b: Rect) -> Option<Rect> {
+    let x = a[0].max(b[0]);
+    let y = a[1].max(b[1]);
+    let right = (a[0] + a[2]).min(b[0] + b[2]);
+    let bottom = (a[1] + a[3]).min(b[1] + b[3]);
+    (right > x && bottom > y).then_some([x, y, right - x, bottom - y])
+}
+
+fn discard_overwritten_writes(input: ImageInput, size: [u32; 2], covered: Rect) -> ImageInput {
+    let ImageInput::Composite { base, mut layers } = input else {
+        return input;
+    };
+    layers.retain(|layer| {
+        !clipped_layer(layer, size).is_ok_and(|result| {
+            result.is_none_or(|([_, _, w, h], [x, y])| {
+                intersect(covered, [x, y, w, h]) == Some([x, y, w, h])
+            })
+        })
+    });
+    let base = discard_overwritten_writes(*base, size, covered);
+    if layers.is_empty() {
+        base
+    } else {
+        ImageInput::Composite { base: Box::new(base), layers }
+    }
+}
+
+/// Keep exactly the writes that a parent copy can sample. The source canvas
+/// keeps its original extent and coordinate origin.
+fn retain_sampled_writes(input: ImageInput, sampled: Rect) -> ImageInput {
+    let Some(size) = extent(&input) else {
+        return input;
+    };
+    if sampled == [0, 0, size[0].into(), size[1].into()] {
+        return input;
+    }
+    let ImageInput::Composite { base, mut layers } = input else {
+        return input;
+    };
+    // A complete RGBA replacement makes every earlier input irrelevant
+    // within the sample, even when the write is partial on the full canvas.
+    let replacement = layers.iter().rposition(|layer| {
+        layer.opacity == 255
+            && matches!(layer.math, ImageCompositeMath::Copy)
+            && extent(&layer.input).is_some()
+            && clipped_layer(layer, size).is_ok_and(|result| {
+                result.is_some_and(|([_, _, w, h], [x, y])| {
+                    intersect(sampled, [x, y, w, h]) == Some(sampled)
+                })
+            })
+    });
+    let base = if let Some(index) = replacement {
+        layers.drain(..index);
+        Box::new(ImageInput::Solid { size, color: [0; 4] })
+    } else {
+        Box::new(retain_sampled_writes(*base, sampled))
+    };
+    let layers: alloc::vec::Vec<_> = layers
+        .into_iter()
+        .filter_map(|mut layer| {
+            let ([sx, sy, w, h], [dx, dy]) = match clipped_layer(&layer, size) {
+                Ok(result) => result?,
+                Err(_) => return Some(layer),
+            };
+            let live = intersect(sampled, [dx, dy, w, h])?;
+            let [x, y, w, h] = live;
+            if matches!(*layer.input, ImageInput::Composite { .. }) {
+                layer.input = Box::new(retain_sampled_writes(
+                    *layer.input,
+                    [sx + x - dx, sy + y - dy, w, h],
+                ));
+            }
+            layer.clip = Some(live.map(|v| v as i32));
+            Some(layer)
+        })
+        .collect();
+    if layers.is_empty() {
+        *base
+    } else {
+        ImageInput::Composite { base, layers }
     }
 }
 
@@ -162,7 +280,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_self_copies_leave_the_graph_bound() {
+    fn unoptimized_self_copies_leave_the_graph_bound() {
         // A partial copy of a graph onto itself duplicates its history in
         // both branches, doubling the node count each time.
         let mut a = solid(1);
@@ -170,11 +288,31 @@ mod tests {
         while a.within_graph_bound() {
             let mut layer = copy(a.clone());
             layer.source = [0, 0, 1, 1];
-            a = a.with_composite_layer(layer);
+            a = ImageInput::Composite { base: Box::new(a), layers: vec![layer] };
             steps += 1;
             assert!(steps < 64, "bound never reached");
         }
         assert!(steps <= 11);
+    }
+
+    #[test]
+    fn repeated_partial_copies_keep_only_the_latest_source_in_the_sample() {
+        let mut a = solid(1);
+        for color in 2..48 {
+            let mut layer = copy(solid(color));
+            layer.source = [0, 0, 1, 1];
+            a = a.with_composite_layer(layer);
+        }
+        let mut layer = copy(a.clone());
+        layer.source = [0, 0, 1, 1];
+        let ImageInput::Composite { layers, .. } = a else { panic!() };
+        assert_eq!(layers.len(), 1);
+        let ImageInput::Composite { layers, .. } = solid(0).with_composite_layer(layer)
+        else { panic!() };
+        let ImageInput::Composite { base, layers } = layers[0].input.as_ref() else { panic!() };
+        assert!(matches!(**base, ImageInput::Solid { color: [0, 0, 0, 0], .. }));
+        assert_eq!(layers.len(), 1);
+        assert!(matches!(*layers[0].input, ImageInput::Solid { color: [47, 47, 47, 47], .. }));
     }
 
     #[test]

@@ -76,6 +76,71 @@ fn ordinary_resource_wait_and_active_frame_do_not_block_startup_presentation() {
 }
 
 #[test]
+fn sliced_portrait_copy_retains_only_intersecting_strips() {
+    use crysirror_core::image_processing::ImageInput;
+
+    let mut rt = Runtime::with_host(KrkrHost::new([8, 8], "default".into()));
+    natives::install(&mut rt);
+    natives::run_source(&mut rt, "strips.tjs", r#"
+        var window = new Window();
+        var root = new Layer(window, null);
+        var face = new Layer(window, root);
+        var strip = new Layer(window, root);
+        face.setImageSize(4, 4);
+        strip.setImageSize(4, 2);
+        strip.fillRect(0, 0, 4, 2, 0xff405060);
+        for (var i = 3; i <= 8; i++) {
+            face.copyRect(0, 0, strip, 0, -i, 4, 2);
+        }
+        face.copyRect(0, 0, strip, 0, -1, 4, 2);
+    "#, None).unwrap();
+    let face = rt.global_member("face").object_handle().unwrap();
+    let ImageInput::Composite { layers, .. } = crate::image_api::input(&rt, face).unwrap() else {
+        panic!("the intersecting row was lost");
+    };
+    assert_eq!(layers.len(), 1);
+    assert_eq!(layers[0].source, [0, -1, 4, 2]);
+}
+
+#[test]
+fn soft_light_batch_omits_tiles_outside_the_draw_clip() {
+    use crysirror_core::image_processing::ImageInput;
+
+    let mut host = KrkrHost::new([8, 8], "default".into());
+    host.can_suspend = true;
+    let mut rt = Runtime::with_host(host);
+    natives::install(&mut rt);
+    natives::run_source(
+        &mut rt,
+        "clipped-tiles.tjs",
+        r#"
+            var window = new Window();
+            var root = new Layer(window, null);
+            var portrait = new Layer(window, root);
+            var tint = new Layer(window, root);
+            portrait.setImageSize(8, 8);
+            portrait.fillRect(0, 0, 8, 8, 0xff405060);
+            tint.setImageSize(2, 2);
+            tint.fillRect(0, 0, 2, 2, 0xff707070);
+            portrait.setClip(2, 2, 2, 2);
+            portrait.operateRect(0, 0, tint, 0, 0, 2, 2, 20, 255);
+            portrait.operateRect(2, 2, tint, -2, 0, 2, 2, 20, 255);
+            portrait.operateRect(1, 2, tint, 0, 0, 2, 2, 20, 255);
+        "#,
+        None,
+    )
+    .unwrap();
+    let portrait = rt.global_member("portrait").object_handle().unwrap();
+    let ImageInput::Composite { layers, .. } = crate::image_api::input(&rt, portrait).unwrap() else {
+        panic!("the intersecting blend was lost");
+    };
+    assert_eq!(rt.host().bitmap_batch.as_ref().unwrap().operations, 1);
+    assert_eq!(layers.len(), 1);
+    assert_eq!(layers[0].destination, [1, 2]);
+    assert_eq!(layers[0].clip, Some([2, 2, 2, 2]));
+}
+
+#[test]
 fn tiled_overlay_batches_preserve_pixels_and_native_instruction_order() {
     use crysirror_core::{
         image_processing::{ImageInput, ImageJob},

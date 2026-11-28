@@ -191,21 +191,28 @@ struct Table {
     /// `RebuildHashMagic` (`tjsObject.h:482`), compared against
     /// [`rebuild_hash_magic`] on every read.
     rebuild_magic: u32,
+    hash_bits: u8,
 }
 
 impl Table {
     fn new(hashbits: u32) -> Self {
         let hashbits = hashbits.min(HASH_BITS_LIMIT).min(HASH_BITS_ALLOCATION_CAP);
-        let size = 1usize << hashbits;
         Self {
-            buckets: vec![Bucket::default(); size],
+            buckets: Vec::new(),
             count: 0,
             rebuild_magic: rebuild_hash_magic(),
+            hash_bits: hashbits as u8,
         }
     }
 
+    /// Empty objects and reclaimed slots retain their logical hash size
+    /// without allocating storage before the first member insertion.
+    fn hash_size(&self) -> usize {
+        1usize << self.hash_bits
+    }
+
     fn mask(&self) -> usize {
-        self.buckets.len() - 1
+        self.hash_size() - 1
     }
 
     fn bucket_of(&self, hash: u32) -> usize {
@@ -214,6 +221,9 @@ impl Table {
 
     /// `tTJSCustomObject::Find` (`tjsObject.cpp:1131-1184`), hint-less path.
     fn find_slot(table: &mut Table, name: &str) -> Option<Slot> {
+        if table.count == 0 {
+            return None;
+        }
         let hash = hash_name(name);
         let bucket = table.bucket_of(hash);
         if table.buckets[bucket].head.is_none() && table.buckets[bucket].chain.is_empty() {
@@ -282,6 +292,10 @@ impl Table {
             }
             return;
         }
+        if table.buckets.is_empty() {
+            let size = table.hash_size();
+            table.buckets.resize_with(size, Bucket::default);
+        }
         let hash = hash_name(&name);
         let bucket = table.bucket_of(hash);
         let symbol = Symbol { name, hash, value };
@@ -296,6 +310,9 @@ impl Table {
 
     /// `DeleteByName` (`tjsObject.cpp:856-891`).
     fn delete(table: &mut Table, name: &str) -> bool {
+        if table.count == 0 {
+            return false;
+        }
         let hash = hash_name(name);
         let bucket = table.bucket_of(hash);
         if table.buckets[bucket].head.is_none() && table.buckets[bucket].chain.is_empty() {
@@ -330,6 +347,9 @@ impl Table {
     /// `InternalEnumMembers` (`tjsObject.cpp:1207-1240`): bucket order, each
     /// bucket's chain front-to-back, then the head.
     fn for_each<F: FnMut(&Symbol)>(&self, mut visit: F) {
+        if self.count == 0 {
+            return;
+        }
         for bucket in &self.buckets {
             for symbol in bucket.chain.iter().rev() {
                 visit(symbol);
@@ -359,11 +379,16 @@ impl Table {
     /// again on every later read.
     fn rebuild(table: &mut Table, requestcount: i64) {
         table.rebuild_magic = rebuild_hash_magic();
-        let hashbits = hash_bits_for_count(requestcount).min(HASH_BITS_ALLOCATION_CAP);
-        let new_size = 1usize << hashbits;
-        if new_size == table.buckets.len() {
+        let hash_bits = hash_bits_for_count(requestcount).min(HASH_BITS_ALLOCATION_CAP) as u8;
+        if hash_bits == table.hash_bits {
             return;
         }
+        table.hash_bits = hash_bits;
+        if table.count == 0 {
+            table.buckets = Vec::new();
+            return;
+        }
+        let new_size = table.hash_size();
         let mask = new_size - 1;
         let mut buckets = vec![Bucket::default(); new_size];
         let mut symbols = Vec::with_capacity(table.count);
@@ -404,7 +429,7 @@ impl SymbolTable {
 
     /// The number of buckets, for diagnostics and tests.
     pub fn hash_size(&self) -> usize {
-        self.table.borrow().buckets.len()
+        self.table.borrow().hash_size()
     }
 
     /// `Count` (`tjsObject.h:478`): the number of live members.
@@ -523,6 +548,22 @@ mod tests {
 
     fn order(table: &SymbolTable) -> Vec<String> {
         table.entries().into_iter().map(|(name, _)| name).collect()
+    }
+
+    #[test]
+    fn empty_table_defers_buckets_and_uses_the_rebuilt_size_on_first_insert() {
+        let table = SymbolTable::with_hash_bits(0);
+        assert_eq!(table.hash_size(), 1);
+        assert!(table.get("missing").is_none());
+        assert!(!table.remove("missing"));
+        assert!(table.table.borrow().buckets.is_empty());
+
+        table.rebuild(16);
+        assert_eq!(table.hash_size(), 64);
+        assert!(table.table.borrow().buckets.is_empty());
+        table.insert("sample", Variant::Integer(1));
+        assert_eq!(table.table.borrow().buckets.len(), 64);
+        assert_eq!(table.get("sample"), Some(Variant::Integer(1)));
     }
 
     /// Hash values produced by the reference function itself, run over the

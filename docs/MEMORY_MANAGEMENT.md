@@ -118,6 +118,12 @@ the same decode. The RGBA surface uses the existing prepared cache budget, and
 the worker uses the shared image scratch budget. A mount refresh invalidates
 the ticket and its metadata together.
 
+Image workers can reuse prepared TLG pixels after verifying the encoded bytes
+through the job's scoped reader. The lookup is nonblocking and checks the
+client, resolved path, dimensions and fingerprint. The destination copy stays
+within the job's scratch reservation. In an ordered composite, consecutive
+writes can reuse the same verified source until the next source is loaded.
+
 ### Dynamic font sources
 
 Outline and shaping consumers share immutable encoded font bytes. The interner
